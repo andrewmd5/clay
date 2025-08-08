@@ -357,6 +357,8 @@ typedef CLAY_PACKED_ENUM {
     CLAY_TEXT_WRAP_WORDS,
     // Don't break on space characters, only on newlines.
     CLAY_TEXT_WRAP_NEWLINES,
+    // Break words at any point to prevent overflow (respecting grapheme clusters)
+    CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD,
     // Disable text wrapping entirely.
     CLAY_TEXT_WRAP_NONE,
 } Clay_TextElementConfigWrapMode;
@@ -1192,6 +1194,29 @@ typedef struct {
 
 CLAY__ARRAY_DEFINE(Clay__MeasuredWord, Clay__MeasuredWordArray)
 
+typedef CLAY_PACKED_ENUM {
+    CLAY__GCB_OTHER,
+    CLAY__GCB_CR,
+    CLAY__GCB_LF,
+    CLAY__GCB_CONTROL,
+    CLAY__GCB_EXTEND,
+    CLAY__GCB_ZWJ,
+    CLAY__GCB_REGIONAL_INDICATOR,
+    CLAY__GCB_SPACING_MARK,
+    CLAY__GCB_L,
+    CLAY__GCB_V,
+    CLAY__GCB_T,
+    CLAY__GCB_LV,
+    CLAY__GCB_LVT,
+    CLAY__GCB_PREPEND,
+} Clay__GraphemeClusterBreak;
+
+typedef struct {
+    uint32_t previousCodepoint;
+    Clay__GraphemeClusterBreak previousGCB;
+    uint8_t riCounter;
+} Clay__GraphemeState;
+
 typedef struct {
     Clay_Dimensions unwrappedDimensions;
     int32_t measuredWordsStartIndex;
@@ -1542,6 +1567,7 @@ uint32_t Clay__HashStringContentsWithConfig(Clay_String *text, Clay_TextElementC
     hash += (hash << 10);
     hash ^= (hash >> 6);
 
+    
     hash += config->letterSpacing;
     hash += (hash << 10);
     hash ^= (hash >> 6);
@@ -1550,6 +1576,125 @@ uint32_t Clay__HashStringContentsWithConfig(Clay_String *text, Clay_TextElementC
     hash ^= (hash >> 11);
     hash += (hash << 15);
     return hash + 1; // Reserve the hash result of zero as "null id"
+}
+
+uint32_t Clay__DecodeUTF8Codepoint(const char *str, int32_t offset, int32_t *bytesRead) {
+    const unsigned char *bytes = (const unsigned char *)str + offset;
+    uint32_t codepoint = 0;
+    int32_t length = 0;
+    
+    if ((bytes[0] & 0x80) == 0) {
+        codepoint = bytes[0];
+        length = 1;
+    } else if ((bytes[0] & 0xE0) == 0xC0) {
+        codepoint = ((bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
+        length = 2;
+    } else if ((bytes[0] & 0xF0) == 0xE0) {
+        codepoint = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+        length = 3;
+    } else if ((bytes[0] & 0xF8) == 0xF0) {
+        codepoint = ((bytes[0] & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) | 
+                    ((bytes[2] & 0x3F) << 6) | (bytes[3] & 0x3F);
+        length = 4;
+    } else {
+        codepoint = 0xFFFD;
+        length = 1;
+    }
+    
+    if (bytesRead) {
+        *bytesRead = length;
+    }
+    return codepoint;
+}
+
+Clay__GraphemeClusterBreak Clay__GetGraphemeClusterBreak(uint32_t codepoint) {
+    if (codepoint == 0x000D) return CLAY__GCB_CR;
+    if (codepoint == 0x000A) return CLAY__GCB_LF;
+    if (codepoint < 0x20 || (codepoint >= 0x7F && codepoint <= 0x9F)) return CLAY__GCB_CONTROL;
+    
+    // Combining marks
+    if ((codepoint >= 0x0300 && codepoint <= 0x036F) ||
+        (codepoint >= 0x1AB0 && codepoint <= 0x1AFF) ||
+        (codepoint >= 0x1DC0 && codepoint <= 0x1DFF) ||
+        (codepoint >= 0x20D0 && codepoint <= 0x20FF) ||
+        (codepoint >= 0xFE20 && codepoint <= 0xFE2F)) {
+        return CLAY__GCB_EXTEND;
+    }
+    
+    // Zero Width Joiner
+    if (codepoint == 0x200D) return CLAY__GCB_ZWJ;
+    
+    // Regional indicators
+    if (codepoint >= 0x1F1E6 && codepoint <= 0x1F1FF) {
+        return CLAY__GCB_REGIONAL_INDICATOR;
+    }
+    
+    // Hangul
+    if (codepoint >= 0x1100 && codepoint <= 0x115F) return CLAY__GCB_L;
+    if (codepoint >= 0x1160 && codepoint <= 0x11A7) return CLAY__GCB_V;
+    if (codepoint >= 0x11A8 && codepoint <= 0x11FF) return CLAY__GCB_T;
+    if (codepoint >= 0xAC00 && codepoint <= 0xD7A3) {
+        int32_t syllableIndex = codepoint - 0xAC00;
+        if ((syllableIndex % 28) == 0) return CLAY__GCB_LV;
+        return CLAY__GCB_LVT;
+    }
+    
+    return CLAY__GCB_OTHER;
+}
+
+bool Clay__IsGraphemeClusterBoundary(Clay__GraphemeState *state, uint32_t curr) {
+    uint32_t prev = state->previousCodepoint;
+    Clay__GraphemeClusterBreak prevGCB = state->previousGCB;
+    Clay__GraphemeClusterBreak currGCB = Clay__GetGraphemeClusterBreak(curr);
+    
+    // Update state
+    state->previousCodepoint = curr;
+    state->previousGCB = currGCB;
+    
+    // Reset RI counter if not regional indicator
+    if (currGCB != CLAY__GCB_REGIONAL_INDICATOR) {
+        state->riCounter = 0;
+    }
+    
+    // GB3: Do not break between CR and LF
+    if (prev == 0x000D && curr == 0x000A) return false;
+    
+    // GB4 & GB5: Break before and after controls
+    if (prevGCB == CLAY__GCB_CONTROL || currGCB == CLAY__GCB_CONTROL) return true;
+    
+    // GB6-8: Hangul syllable sequences
+    if (prevGCB == CLAY__GCB_L && 
+        (currGCB == CLAY__GCB_L || currGCB == CLAY__GCB_V || 
+         currGCB == CLAY__GCB_LV || currGCB == CLAY__GCB_LVT)) return false;
+    
+    if ((prevGCB == CLAY__GCB_LV || prevGCB == CLAY__GCB_V) &&
+        (currGCB == CLAY__GCB_V || currGCB == CLAY__GCB_T)) return false;
+    
+    if ((prevGCB == CLAY__GCB_LVT || prevGCB == CLAY__GCB_T) && 
+        currGCB == CLAY__GCB_T) return false;
+    
+    // GB9: Do not break before extending characters or ZWJ
+    if (currGCB == CLAY__GCB_EXTEND || currGCB == CLAY__GCB_ZWJ) return false;
+    
+    // GB9a: Do not break before SpacingMark
+    if (currGCB == CLAY__GCB_SPACING_MARK) return false;
+    
+    // GB9b: Do not break after Prepend
+    if (prevGCB == CLAY__GCB_PREPEND) return false;
+    
+    // GB11: Do not break within emoji ZWJ sequences
+    if (prevGCB == CLAY__GCB_ZWJ) return false;
+    
+    // GB12/13: Regional indicator pairs
+    if (prevGCB == CLAY__GCB_REGIONAL_INDICATOR && 
+        currGCB == CLAY__GCB_REGIONAL_INDICATOR && 
+        state->riCounter == 0) {
+        state->riCounter = 1;
+        return false;
+    }
+    
+    // GB999: Otherwise break
+    return true;
 }
 
 Clay__MeasuredWord *Clay__AddMeasuredWord(Clay__MeasuredWord word, Clay__MeasuredWord *previousWord) {
@@ -1580,7 +1725,9 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
         return &Clay__MeasureTextCacheItem_DEFAULT;
     }
     #endif
+
     uint32_t id = Clay__HashStringContentsWithConfig(text, config);
+
     uint32_t hashBucket = id % (context->maxMeasureTextCacheWordCount / 32);
     int32_t elementIndexPrevious = 0;
     int32_t elementIndex = context->measureTextHashMap.internalArray[hashBucket];
@@ -1639,73 +1786,148 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
         newItemIndex = context->measureTextHashMapInternal.length - 1;
     }
 
-    int32_t start = 0;
-    int32_t end = 0;
-    float lineWidth = 0;
-    float measuredWidth = 0;
-    float measuredHeight = 0;
-    float spaceWidth = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = 1, .chars = CLAY__SPACECHAR.chars, .baseChars = CLAY__SPACECHAR.chars }, config, context->measureTextUserData).width;
-    Clay__MeasuredWord tempWord = { .next = -1 };
-    Clay__MeasuredWord *previousWord = &tempWord;
-    while (end < text->length) {
-        if (context->measuredWords.length == context->measuredWords.capacity - 1) {
-            if (!context->booleanWarnings.maxTextMeasureCacheExceeded) {
-                context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) {
-                    .errorType = CLAY_ERROR_TYPE_TEXT_MEASUREMENT_CAPACITY_EXCEEDED,
-                    .errorText = CLAY_STRING("Clay has run out of space in it's internal text measurement cache. Try using Clay_SetMaxMeasureTextCacheWordCount() (default 16384, with 1 unit storing 1 measured word)."),
-                    .userData = context->errorHandler.userData });
-                context->booleanWarnings.maxTextMeasureCacheExceeded = true;
-            }
-            return &Clay__MeasureTextCacheItem_DEFAULT;
-        }
-        char current = text->chars[end];
-        if (current == ' ' || current == '\n') {
-            int32_t length = end - start;
-            Clay_Dimensions dimensions = {};
-            if (length > 0) {
-                dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) {.length = length, .chars = &text->chars[start], .baseChars = text->chars}, config, context->measureTextUserData);
-            }
-            measured->minWidth = CLAY__MAX(dimensions.width, measured->minWidth);
-            measuredHeight = CLAY__MAX(measuredHeight, dimensions.height);
-            if (current == ' ') {
-                dimensions.width += spaceWidth;
-                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length + 1, .width = dimensions.width, .next = -1 }, previousWord);
-                lineWidth += dimensions.width;
-            }
-            if (current == '\n') {
-                if (length > 0) {
-                    previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length, .width = dimensions.width, .next = -1 }, previousWord);
-                }
-                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = end + 1, .length = 0, .width = 0, .next = -1 }, previousWord);
-                lineWidth += dimensions.width;
-                measuredWidth = CLAY__MAX(lineWidth, measuredWidth);
-                measured->containsNewlines = true;
-                lineWidth = 0;
-            }
-            start = end + 1;
-        }
-        end++;
-    }
-    if (end - start > 0) {
-        Clay_Dimensions dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = end - start, .chars = &text->chars[start], .baseChars = text->chars }, config, context->measureTextUserData);
-        Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = end - start, .width = dimensions.width, .next = -1 }, previousWord);
-        lineWidth += dimensions.width;
-        measuredHeight = CLAY__MAX(measuredHeight, dimensions.height);
-        measured->minWidth = CLAY__MAX(dimensions.width, measured->minWidth);
-    }
-    measuredWidth = CLAY__MAX(lineWidth, measuredWidth) - config->letterSpacing;
+    // Measurement state (O(n))
+    int32_t i = 0;
+    float lineWidth = 0.0f;
+    float measuredWidth = 0.0f;
+    float measuredHeight = 0.0f;
 
+    float spaceWidth = Clay__MeasureText(
+        CLAY__INIT(Clay_StringSlice){ .length = 1, .chars = CLAY__SPACECHAR.chars, .baseChars = CLAY__SPACECHAR.chars },
+        config, context->measureTextUserData).width;
+
+    float maxWordWidth = 0.0f;      // for CLAY_TEXT_WRAP_WORDS
+    float maxClusterWidth = 0.0f;   // for CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD
+
+    // Helper to add a measured token safely (capacity checked)
+    #define CLAY__ENSURE_WORD_CAPACITY_OR_RETURN_DEFAULT() \
+        do { \
+            if (context->measuredWords.length >= context->measuredWords.capacity - 1) { \
+                if (!context->booleanWarnings.maxTextMeasureCacheExceeded) { \
+                    context->errorHandler.errorHandlerFunction(CLAY__INIT(Clay_ErrorData) { \
+                        .errorType = CLAY_ERROR_TYPE_TEXT_MEASUREMENT_CAPACITY_EXCEEDED, \
+                        .errorText = CLAY_STRING("Clay has run out of space in it's internal text measurement cache. Try using Clay_SetMaxMeasureTextCacheWordCount() (default 16384, with 1 unit storing 1 measured word)."), \
+                        .userData = context->errorHandler.userData }); \
+                    context->booleanWarnings.maxTextMeasureCacheExceeded = true; \
+                } \
+                return &Clay__MeasureTextCacheItem_DEFAULT; \
+            } \
+        } while(0)
+
+    Clay__MeasuredWord tempWord = (Clay__MeasuredWord){ .next = -1 };
+    Clay__MeasuredWord *previousWord = &tempWord;
+
+    while (i < text->length) {
+        char ch = text->chars[i];
+
+        // Explicit newline → zero-length token; reset line width
+        if (ch == '\n') {
+            CLAY__ENSURE_WORD_CAPACITY_OR_RETURN_DEFAULT();
+            previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord){
+                .startOffset = i + 1, .length = 0, .width = 0, .next = -1
+            }, previousWord);
+            measuredWidth = CLAY__MAX(measuredWidth, lineWidth);
+            measured->containsNewlines = true;
+            lineWidth = 0.0f;
+            i += 1;
+            continue;
+        }
+
+        // Run of spaces → one token with width = n * spaceWidth
+        if (ch == ' ') {
+            int32_t s = i;
+            while (i < text->length && text->chars[i] == ' ') i++;
+            int32_t count = i - s;
+            if (count > 0) {
+                CLAY__ENSURE_WORD_CAPACITY_OR_RETURN_DEFAULT();
+                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord){
+                    .startOffset = s, .length = count, .width = (float)count * spaceWidth, .next = -1
+                }, previousWord);
+                lineWidth += (float)count * spaceWidth;
+            }
+            continue;
+        }
+
+        // Word (sequence of non-space, non-newline bytes)
+        int32_t start = i;
+        while (i < text->length) {
+            char c = text->chars[i];
+            if (c == ' ' || c == '\n') break;
+            i++;
+        }
+        int32_t len = i - start;
+
+        // Measure the whole word once
+        CLAY__ENSURE_WORD_CAPACITY_OR_RETURN_DEFAULT();
+        Clay_Dimensions dim = Clay__MeasureText(
+            CLAY__INIT(Clay_StringSlice){ .length = len, .chars = &text->chars[start], .baseChars = text->chars },
+            config, context->measureTextUserData
+        );
+        previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord){
+            .startOffset = start, .length = len, .width = dim.width, .next = -1
+        }, previousWord);
+
+        lineWidth += dim.width;
+        measuredHeight = CLAY__MAX(measuredHeight, dim.height);
+
+        // Track minWidth by mode
+        if (config->wrapMode == CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD) {
+            // Find widest grapheme cluster inside this word
+            Clay__GraphemeState gs = CLAY__INIT(Clay__GraphemeState) CLAY__DEFAULT_STRUCT;
+            int32_t pos = start;
+            int32_t clusterStart = start;
+            while (pos < start + len) {
+                int32_t br = 0;
+                uint32_t cp = Clay__DecodeUTF8Codepoint(text->chars, pos, &br);
+                pos += br;
+                if (Clay__IsGraphemeClusterBoundary(&gs, cp)) {
+                    int32_t clen = pos - clusterStart;
+                    Clay_Dimensions cdim = Clay__MeasureText(
+                        CLAY__INIT(Clay_StringSlice){ .length = clen, .chars = &text->chars[clusterStart], .baseChars = text->chars },
+                        config, context->measureTextUserData
+                    );
+                    maxClusterWidth = CLAY__MAX(maxClusterWidth, cdim.width);
+                    measuredHeight = CLAY__MAX(measuredHeight, cdim.height);
+                    clusterStart = pos;
+                }
+            }
+            if (clusterStart < start + len) {
+                int32_t clen = (start + len) - clusterStart;
+                Clay_Dimensions cdim = Clay__MeasureText(
+                    CLAY__INIT(Clay_StringSlice){ .length = clen, .chars = &text->chars[clusterStart], .baseChars = text->chars },
+                    config, context->measureTextUserData
+                );
+                maxClusterWidth = CLAY__MAX(maxClusterWidth, cdim.width);
+                measuredHeight = CLAY__MAX(measuredHeight, cdim.height);
+            }
+        } else if (config->wrapMode == CLAY_TEXT_WRAP_WORDS) {
+            maxWordWidth = CLAY__MAX(maxWordWidth, dim.width);
+        }
+    }
+
+    measuredWidth = CLAY__MAX(measuredWidth, lineWidth);
     measured->measuredWordsStartIndex = tempWord.next;
     measured->unwrappedDimensions.width = measuredWidth;
     measured->unwrappedDimensions.height = measuredHeight;
+
+    // minWidth depends on wrap behavior
+    if (config->wrapMode == CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD) {
+        measured->minWidth = maxClusterWidth;              // we can break at cluster boundaries
+    } else if (config->wrapMode == CLAY_TEXT_WRAP_WORDS) {
+        measured->minWidth = maxWordWidth;                 // we can break only at spaces
+    } else { // NEWLINES or NONE: no wrapping on spaces
+        measured->minWidth = measuredWidth;                // longest unwrapped line
+    }
 
     if (elementIndexPrevious != 0) {
         Clay__MeasureTextCacheItemArray_Get(&context->measureTextHashMapInternal, elementIndexPrevious)->nextIndex = newItemIndex;
     } else {
         context->measureTextHashMap.internalArray[hashBucket] = newItemIndex;
     }
+
     return measured;
 }
+
 
 bool Clay__PointIsInsideRect(Clay_Vector2 point, Clay_BoundingBox rect) {
     return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
@@ -2306,7 +2528,9 @@ void Clay__SizeContainersAlongAxis(bool xAxis) {
 
                 if (childSizing.type != CLAY__SIZING_TYPE_PERCENT
                     && childSizing.type != CLAY__SIZING_TYPE_FIXED
-                    && (!Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT) || (Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_WORDS)) // todo too many loops
+                    && (!Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT) || 
+                        (Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_WORDS ||
+                        Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD)) // todo too many loops
 //                    && (xAxis || !Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_ASPECT))
                 ) {
                     Clay__int32_tArray_Add(&resizableContainerBuffer, childElementIndex);
@@ -2522,58 +2746,290 @@ void Clay__CalculateFinalLayout(void) {
     // Calculate sizing along the X axis
     Clay__SizeContainersAlongAxis(true);
 
-    // Wrap text
+    // Wrap text 
     for (int32_t textElementIndex = 0; textElementIndex < context->textElementData.length; ++textElementIndex) {
         Clay__TextElementData *textElementData = Clay__TextElementDataArray_Get(&context->textElementData, textElementIndex);
-        textElementData->wrappedLines = CLAY__INIT(Clay__WrappedTextLineArraySlice) { .length = 0, .internalArray = &context->wrappedTextLines.internalArray[context->wrappedTextLines.length] };
+        textElementData->wrappedLines = CLAY__INIT(Clay__WrappedTextLineArraySlice) { 
+            .length = 0, 
+            .internalArray = &context->wrappedTextLines.internalArray[context->wrappedTextLines.length] 
+        };
         Clay_LayoutElement *containerElement = Clay_LayoutElementArray_Get(&context->layoutElements, (int)textElementData->elementIndex);
         Clay_TextElementConfig *textConfig = Clay__FindElementConfigWithType(containerElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig;
         Clay__MeasureTextCacheItem *measureTextCacheItem = Clay__MeasureTextCached(&textElementData->text, textConfig);
-        float lineWidth = 0;
+    
+        float containerWidth = containerElement->dimensions.width;
+        float lineWidth = 0.0f;
         float lineHeight = textConfig->lineHeight > 0 ? (float)textConfig->lineHeight : textElementData->preferredDimensions.height;
         int32_t lineLengthChars = 0;
         int32_t lineStartOffset = 0;
-        if (!measureTextCacheItem->containsNewlines && textElementData->preferredDimensions.width <= containerElement->dimensions.width) {
-            Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { containerElement->dimensions,  textElementData->text });
+    
+        // queued "glue" spaces between words (never end a line with these)
+        int32_t pendingSpaces = 0;
+    
+        // used when we split a token across lines (word or spaces), without mutating cache
+        int32_t partialStart = -1;
+        int32_t partialLimit = -1;
+    
+        // whether we added a trailing letterSpacing to this line (so we can subtract it on flush)
+        bool trailingLSAdded = false;
+    
+        // Fast path: text fits on one line
+        if (!measureTextCacheItem->containsNewlines && textElementData->preferredDimensions.width <= containerWidth) {
+            Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { 
+                containerElement->dimensions, 
+                textElementData->text 
+            });
             textElementData->wrappedLines.length++;
             continue;
         }
-        float spaceWidth = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = 1, .chars = CLAY__SPACECHAR.chars, .baseChars = CLAY__SPACECHAR.chars }, textConfig, context->measureTextUserData).width;
+    
+        float spaceWidth = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { 
+            .length = 1, .chars = CLAY__SPACECHAR.chars, .baseChars = CLAY__SPACECHAR.chars 
+        }, textConfig, context->measureTextUserData).width;
+    
+        // Process measured tokens
         int32_t wordIndex = measureTextCacheItem->measuredWordsStartIndex;
+    
         while (wordIndex != -1) {
-            if (context->wrappedTextLines.length > context->wrappedTextLines.capacity - 1) {
-                break;
+            if (context->wrappedTextLines.length > context->wrappedTextLines.capacity - 1) break;
+        
+            Clay__MeasuredWord *mw = Clay__MeasuredWordArray_Get(&context->measuredWords, wordIndex);
+        
+            // Finished splitting previous token?
+            if (partialStart >= 0 && partialStart >= partialLimit) {
+                partialStart = -1;
+                partialLimit = -1;
+                wordIndex = mw->next;
+                continue;
             }
-            Clay__MeasuredWord *measuredWord = Clay__MeasuredWordArray_Get(&context->measuredWords, wordIndex);
-            // Only word on the line is too large, just render it anyway
-            if (lineLengthChars == 0 && lineWidth + measuredWord->width > containerElement->dimensions.width) {
-                Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { { measuredWord->width, lineHeight }, { .length = measuredWord->length, .chars = &textElementData->text.chars[measuredWord->startOffset] } });
-                textElementData->wrappedLines.length++;
-                wordIndex = measuredWord->next;
-                lineStartOffset = measuredWord->startOffset + measuredWord->length;
-            }
-            // measuredWord->length == 0 means a newline character
-            else if (measuredWord->length == 0 || lineWidth + measuredWord->width > containerElement->dimensions.width) {
-                // Wrapped text lines list has overflowed, just render out the line
-                bool finalCharIsSpace = textElementData->text.chars[CLAY__MAX(lineStartOffset + lineLengthChars - 1, 0)] == ' ';
-                Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { { lineWidth + (finalCharIsSpace ? -spaceWidth : 0), lineHeight }, { .length = lineLengthChars + (finalCharIsSpace ? -1 : 0), .chars = &textElementData->text.chars[lineStartOffset] } });
-                textElementData->wrappedLines.length++;
-                if (lineLengthChars == 0 || measuredWord->length == 0) {
-                    wordIndex = measuredWord->next;
+        
+            // Newline token (length==0)
+            if (mw->length == 0) {
+                if (lineLengthChars > 0) {
+                    float outW = lineWidth - (trailingLSAdded ? textConfig->letterSpacing : 0.0f);
+                    if (outW < 0) outW = 0;
+                    Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { 
+                        { outW, lineHeight }, 
+                        { .length = lineLengthChars, .chars = &textElementData->text.chars[lineStartOffset] } 
+                    });
+                    textElementData->wrappedLines.length++;
+                } else {
+                    Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { 
+                        { 0, lineHeight }, 
+                        { .length = 0, .chars = &textElementData->text.chars[lineStartOffset] } 
+                    });
+                    textElementData->wrappedLines.length++;
                 }
-                lineWidth = 0;
+                // reset for next line
+                lineWidth = 0.0f;
                 lineLengthChars = 0;
-                lineStartOffset = measuredWord->startOffset;
+                lineStartOffset = mw->startOffset; // just after '\n'
+                pendingSpaces = 0;
+                trailingLSAdded = false;
+                partialStart = -1;
+                partialLimit  = -1;
+                wordIndex = mw->next;
+                continue;
+            }
+        
+            // ----- Leading spaces as content (can wrap) -----
+            // If token (or remainder) is spaces *and* we're at start-of-line, lay them out now.
+            if (lineLengthChars == 0) {
+                int32_t segStart0 = (partialStart >= 0) ? partialStart : mw->startOffset;
+                int32_t segLimit0 = (partialStart >= 0) ? partialLimit : (mw->startOffset + mw->length);
+                if (textElementData->text.chars[segStart0] == ' ') {
+                    // how many spaces are left in this run
+                    int32_t remaining = segLimit0 - segStart0; // ASCII ' ' -> 1 byte per space
+                    // how many spaces fit on this empty line
+                    int32_t fit = (int32_t)(containerWidth / CLAY__MAX(spaceWidth, 0.00001f));
+                    if (fit <= 0) fit = 1; // always make progress
+                    int32_t take = remaining < fit ? remaining : fit;
+                
+                    // place them
+                    if (lineLengthChars == 0) lineStartOffset = segStart0;
+                    lineWidth += (float)take * spaceWidth;
+                    lineLengthChars += take;
+                
+                    if (take == remaining) {
+                        // consumed whole space run; advance to next token
+                        if (partialStart >= 0) { partialStart = -1; partialLimit = -1; }
+                        wordIndex = mw->next;
+                    } else {
+                        // filled the line with spaces only; flush and continue with remainder of this run
+                        Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+                            { lineWidth, lineHeight },
+                            { .length = lineLengthChars, .chars = &textElementData->text.chars[lineStartOffset] }
+                        });
+                        textElementData->wrappedLines.length++;
+                    
+                        // prepare remainder of this space run for next line
+                        lineWidth = 0.0f;
+                        lineLengthChars = 0;
+                        partialStart = segStart0 + take;
+                        partialLimit = segLimit0;
+                        lineStartOffset = partialStart;
+                        // keep wordIndex the same to continue splitting this run
+                    }
+                    continue;
+                }
+            }
+        
+            // ----- Queue inter-word spaces (glue) -----
+            if (partialStart < 0 && textElementData->text.chars[mw->startOffset] == ' ') {
+                pendingSpaces += mw->length; // will be applied before the next word if it fits
+                wordIndex = mw->next;
+                continue;
+            }
+        
+            // Determine the candidate word slice to place
+            int32_t segStart = (partialStart >= 0) ? partialStart : mw->startOffset;
+            int32_t segLimit = (partialStart >= 0) ? partialLimit : (mw->startOffset + mw->length);
+        
+            // Width of that slice (use cache for full words; measure for partials)
+            float wordWidth = 0.0f;
+            if (partialStart >= 0) {
+                Clay_Dimensions d = Clay__MeasureText(
+                    CLAY__INIT(Clay_StringSlice){ .length = segLimit - segStart, .chars = &textElementData->text.chars[segStart], .baseChars = textElementData->text.chars },
+                    textConfig, context->measureTextUserData
+                );
+                wordWidth = d.width;
             } else {
-                lineWidth += measuredWord->width + textConfig->letterSpacing;
-                lineLengthChars += measuredWord->length;
-                wordIndex = measuredWord->next;
+                wordWidth = mw->width;
+            }
+        
+            // Fit test (include queued glue only if there is already content)
+            float glueWidth = (lineLengthChars > 0 && pendingSpaces > 0) ? (float)pendingSpaces * spaceWidth : 0.0f;
+            float candidateAdd = glueWidth + wordWidth + (lineLengthChars > 0 ? textConfig->letterSpacing : 0.0f);
+        
+            if (lineWidth + candidateAdd <= containerWidth) {
+                // Place: consume glue + word
+                if (lineLengthChars == 0) {
+                    lineStartOffset = segStart;
+                    lineWidth += wordWidth;                // no glue/letterSpacing on empty line
+                    trailingLSAdded = false;
+                } else {
+                    lineWidth += glueWidth + wordWidth + textConfig->letterSpacing;
+                    trailingLSAdded = true;
+                }
+                lineLengthChars += pendingSpaces + (segLimit - segStart);
+                pendingSpaces = 0;
+            
+                if (partialStart >= 0) { partialStart = -1; partialLimit = -1; }
+                wordIndex = mw->next;
+                continue;
+            }
+        
+            // Doesn't fit
+            if (lineLengthChars > 0) {
+                // Flush current line (drop queued spaces; no trailing spaces at EOL)
+                float outW = lineWidth - (trailingLSAdded ? textConfig->letterSpacing : 0.0f);
+                if (outW < 0) outW = 0;
+                Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { 
+                    { outW, lineHeight }, 
+                    { .length = lineLengthChars, .chars = &textElementData->text.chars[lineStartOffset] } 
+                });
+                textElementData->wrappedLines.length++;
+            
+                // Start fresh; re-evaluate the same word on next loop
+                lineWidth = 0.0f;
+                lineLengthChars = 0;
+                lineStartOffset = segStart;
+                pendingSpaces = 0;
+                trailingLSAdded = false;
+                continue;
+            }
+        
+            // First segment on a new line doesn't fit
+            if (textConfig->wrapMode == CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD) {
+                // Grapheme-aware fallback: largest prefix that fits
+                int32_t bestEnd = segStart;
+                float   bestWidth = 0.0f;
+            
+                Clay__GraphemeState gs = CLAY__INIT(Clay__GraphemeState) CLAY__DEFAULT_STRUCT;
+                int32_t probe = segStart;
+                while (probe < segLimit) {
+                    int32_t br = 0;
+                    (void)Clay__DecodeUTF8Codepoint(textElementData->text.chars, probe, &br);
+                    int32_t next = probe + br;
+                    while (next < segLimit) {
+                        int32_t br2 = 0;
+                        uint32_t cp2 = Clay__DecodeUTF8Codepoint(textElementData->text.chars, next, &br2);
+                        if (Clay__IsGraphemeClusterBoundary(&gs, cp2)) break;
+                        next += br2;
+                    }
+                    Clay_Dimensions cand = Clay__MeasureText(
+                        CLAY__INIT(Clay_StringSlice){ .length = next - segStart, .chars = &textElementData->text.chars[segStart], .baseChars = textElementData->text.chars },
+                        textConfig, context->measureTextUserData
+                    );
+                    if (cand.width <= containerWidth) { bestEnd = next; bestWidth = cand.width; probe = next; }
+                    else break;
+                }
+            
+                // If nothing fit, force one grapheme
+                if (bestEnd == segStart) {
+                    int32_t next = segStart;
+                    if (next < segLimit) {
+                        int32_t br = 0; (void)Clay__DecodeUTF8Codepoint(textElementData->text.chars, next, &br);
+                        next += br;
+                        while (next < segLimit) {
+                            int32_t br2 = 0;
+                            uint32_t cp2 = Clay__DecodeUTF8Codepoint(textElementData->text.chars, next, &br2);
+                            if (Clay__IsGraphemeClusterBoundary(&gs, cp2)) break;
+                            next += br2;
+                        }
+                    }
+                    Clay_Dimensions forced = Clay__MeasureText(
+                        CLAY__INIT(Clay_StringSlice){ .length = next - segStart, .chars = &textElementData->text.chars[segStart], .baseChars = textElementData->text.chars },
+                        textConfig, context->measureTextUserData
+                    );
+                    bestEnd = next; bestWidth = forced.width;
+                }
+            
+                // Emit the line
+                Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) {
+                    { bestWidth, lineHeight },
+                    { .length = bestEnd - segStart, .chars = &textElementData->text.chars[segStart] }
+                });
+                textElementData->wrappedLines.length++;
+            
+                // Prepare remainder of this word
+                lineWidth = 0.0f;
+                lineLengthChars = 0;
+                lineStartOffset = bestEnd;
+                trailingLSAdded = false;
+            
+                if (bestEnd < segLimit) {
+                    partialStart = bestEnd;
+                    partialLimit = segLimit; // keep wordIndex the same
+                } else {
+                    partialStart = -1;
+                    partialLimit = -1;
+                    wordIndex = mw->next;
+                }
+            } else {
+                // Non break-word modes: allow overflow (legacy behavior)
+                float candidateWidth = wordWidth + (lineLengthChars > 0 ? textConfig->letterSpacing : 0.0f);
+                lineWidth = candidateWidth;
+                lineLengthChars = (segLimit - segStart);
+                lineStartOffset = segStart;
+                pendingSpaces = 0;
+                trailingLSAdded = (lineLengthChars > 0); // if we added LS
+                if (partialStart >= 0) { partialStart = -1; partialLimit = -1; }
+                wordIndex = mw->next;
             }
         }
+    
+        // Final line
         if (lineLengthChars > 0) {
-            Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { { lineWidth - textConfig->letterSpacing, lineHeight }, {.length = lineLengthChars, .chars = &textElementData->text.chars[lineStartOffset] } });
+            float outW = lineWidth - (trailingLSAdded ? textConfig->letterSpacing : 0.0f);
+            if (outW < 0) outW = 0;
+            Clay__WrappedTextLineArray_Add(&context->wrappedTextLines, CLAY__INIT(Clay__WrappedTextLine) { 
+                { outW, lineHeight }, 
+                { .length = lineLengthChars, .chars = &textElementData->text.chars[lineStartOffset] } 
+            });
             textElementData->wrappedLines.length++;
         }
+    
         containerElement->dimensions.height = lineHeight * (float)textElementData->wrappedLines.length;
     }
 
@@ -3630,6 +4086,8 @@ void Clay__RenderDebugView(void) {
                                     wrapMode = CLAY_STRING("NONE");
                                 } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_NEWLINES) {
                                     wrapMode = CLAY_STRING("NEWLINES");
+                                } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_OVERFLOW_BREAK_WORD) {
+                                    wrapMode = CLAY_STRING("OVERFLOW_BREAK_WORD");
                                 }
                                 CLAY_TEXT(wrapMode, infoTextConfig);
                                 // .textAlignment
