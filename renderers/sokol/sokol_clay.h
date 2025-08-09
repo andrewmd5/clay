@@ -101,6 +101,20 @@
 
 typedef int sclay_font_t;
 
+typedef struct {
+    // the texture image
+    sg_image image;
+    // the texture sampler
+    sg_sampler smp;
+    // texture coordinates
+    struct {
+        float u0;
+        float v0;
+        float u1;
+        float v1;
+    } uv;
+} sclay_image;
+
 void sclay_setup();
 void sclay_shutdown();
 
@@ -119,6 +133,9 @@ void sclay_handle_event(const sapp_event *ev);
 void sclay_set_layout_dimensions(Clay_Dimensions size, float dpi_scale);
 
 void sclay_render(Clay_RenderCommandArray renderCommands, sclay_font_t *fonts);
+
+sclay_image sclay_make_image(sg_image img, sg_sampler smp);
+sclay_image sclay_make_image_region(sg_image img, sg_sampler smp, float u0, float v0, float u1, float v1);
 
 #endif /* SOKOL_CLAY_INCLUDED */
 
@@ -290,6 +307,63 @@ static void _draw_corner_border(float x, float y, float rx, float ry, float ix, 
     sgl_v2f(x+(rx*_SIN[0]), y+(ry*_SIN[15]));
 }
 
+static void _img_rect(float x, float y, float w, float h,
+                      float u0, float v0, float u1, float v1){
+    /* same vertex pattern as _draw_rect, but with texcoords */
+    sgl_v2f_t2f(x,     y,     u0, v0);
+    sgl_v2f_t2f(x,     y,     u0, v0);
+    sgl_v2f_t2f(x + w, y,     u1, v0);
+    sgl_v2f_t2f(x,     y + h, u0, v1);
+    sgl_v2f_t2f(x + w, y + h, u1, v1);
+    sgl_v2f_t2f(x + w, y + h, u1, v1);
+}
+
+static void _img_corner(float cx, float cy, float rx, float ry,
+                        float bbox_x, float bbox_y, float bbox_w, float bbox_h,
+                        float u0, float v0, float u1, float v1){
+    float x = cx - rx;
+    float y = cy - ry;
+
+    /* helper to map to UVs */
+    #define MAP_U(px) (u0 + ((px - bbox_x) / bbox_w) * (u1 - u0))
+    #define MAP_V(py) (v0 + ((py - bbox_y) / bbox_h) * (v1 - v0))
+
+    /* first degenerate to start strip cleanly */
+    float px0 = x;
+    float py0 = y;
+    sgl_v2f_t2f(px0, py0, MAP_U(px0), MAP_V(py0));
+
+    for(int i = 0; i < 16; ++i){
+        float px1 = x + (rx * _SIN[15 - i]);
+        float py1 = y + (ry * _SIN[i]);
+        sgl_v2f_t2f(px0, py0, MAP_U(px0), MAP_V(py0));
+        sgl_v2f_t2f(px1, py1, MAP_U(px1), MAP_V(py1));
+    }
+
+    float px2 = x + (rx * _SIN[0]);
+    float py2 = y + (ry * _SIN[15]);
+    sgl_v2f_t2f(px2, py2, MAP_U(px2), MAP_V(py2));
+
+    #undef MAP_U
+    #undef MAP_V
+}
+
+sclay_image sclay_make_image(sg_image img, sg_sampler smp) {
+    return (sclay_image){
+        .image = img,
+        .smp   = smp,
+        .uv    = { 0.0f, 0.0f, 1.0f, 1.0f }
+    };
+}
+
+sclay_image sclay_make_image_region(sg_image img, sg_sampler smp, float u0, float v0, float u1, float v1) {
+    return (sclay_image){
+        .image = img,
+        .smp   = smp,
+        .uv    = { u0, v0, u1, v1 }
+    };
+}
+
 void sclay_render(Clay_RenderCommandArray renderCommands, sclay_font_t *fonts) {
     sgl_matrix_mode_modelview();
     sgl_translate(-1.0f, 1.0f, 0.0f);
@@ -415,7 +489,158 @@ void sclay_render(Clay_RenderCommandArray renderCommands, sclay_font_t *fonts) {
                 break;
             }
             case CLAY_RENDER_COMMAND_TYPE_IMAGE: {
-                //TODO
+                Clay_ImageRenderData *config = &renderCommand->renderData.image;
+                if (!config->imageData) break;
+
+                const sclay_image *img = (const sclay_image *)config->imageData;
+
+                // Treat {0,0,0,0} as "untinted" (render as-is / white)
+                Clay_Color tint = config->backgroundColor;
+                const bool untinted = (tint.r==0 && tint.g==0 && tint.b==0 && tint.a==0);
+                const float cr = untinted ? 1.0f : (tint.r / 255.0f);
+                const float cg = untinted ? 1.0f : (tint.g / 255.0f);
+                const float cb = untinted ? 1.0f : (tint.b / 255.0f);
+                const float ca = untinted ? 1.0f : (tint.a / 255.0f);
+
+                sgl_enable_texture();
+                sgl_texture(img->image, img->smp);
+                sgl_c4f(cr, cg, cb, ca);
+
+                const float x = bbox.x;
+                const float y = bbox.y;
+                const float w = bbox.width;
+                const float h = bbox.height;
+
+                const float u0 = img->uv.u0, v0 = img->uv.v0, u1 = img->uv.u1, v1 = img->uv.v1;
+                const Clay_CornerRadius r = config->cornerRadius;
+
+                sgl_begin_triangle_strip();
+
+                if (r.topLeft>0 || r.topRight>0 || r.bottomLeft>0 || r.bottomRight>0){
+                    // top corners + top strip
+                    if (r.topLeft > 0 || r.topRight > 0){
+                        _img_corner(x,     y,     -r.topLeft,  -r.topLeft,  x, y, w, h, u0, v0, u1, v1);
+                        _img_corner(x + w, y,      r.topRight, -r.topRight, x, y, w, h, u0, v0, u1, v1);
+                        _img_rect  (x + r.topLeft, y,
+                                    w - r.topLeft - r.topRight, CLAY__MAX(r.topLeft, r.topRight),
+                                    u0 + (r.topLeft/w)*(u1-u0), v0,
+                                    u1 - (r.topRight/w)*(u1-u0),
+                                    v0 + (CLAY__MAX(r.topLeft, r.topRight)/h)*(v1-v0));
+                    }
+                
+                    // bottom corners + bottom strip
+                    if (r.bottomLeft > 0 || r.bottomRight > 0){
+                        _img_corner(x,     y + h, -r.bottomLeft,  r.bottomLeft,  x, y, w, h, u0, v0, u1, v1);
+                        _img_corner(x + w, y + h,  r.bottomRight, r.bottomRight, x, y, w, h, u0, v0, u1, v1);
+                        _img_rect  (x + r.bottomLeft, y + h - CLAY__MAX(r.bottomLeft, r.bottomRight),
+                                    w - r.bottomLeft - r.bottomRight, CLAY__MAX(r.bottomLeft, r.bottomRight),
+                                    u0 + (r.bottomLeft/w)*(u1-u0),
+                                    v1 - (CLAY__MAX(r.bottomLeft, r.bottomRight)/h)*(v1-v0),
+                                    u1 - (r.bottomRight/w)*(u1-u0), v1);
+                    }
+                
+                    // left vertical body
+                    if (r.topLeft < r.bottomLeft){
+                        if (r.topLeft < r.topRight){
+                            _img_rect(x, y + r.topLeft,
+                                      r.topLeft, h - r.topLeft - r.bottomLeft,
+                                      u0, v0 + (r.topLeft/h)*(v1-v0),
+                                      u0 + (r.topLeft/w)*(u1-u0),
+                                      v1 - (r.bottomLeft/h)*(v1-v0));
+                            _img_rect(x + r.topLeft, y + r.topRight,
+                                      r.bottomLeft - r.topLeft, h - r.topRight - r.bottomLeft,
+                                      u0 + (r.topLeft/w)*(u1-u0),
+                                      v0 + (r.topRight/h)*(v1-v0),
+                                      u0 + (r.bottomLeft/w)*(u1-u0),
+                                      v1 - (r.bottomLeft/h)*(v1-v0));
+                        } else {
+                            _img_rect(x, y + r.topLeft,
+                                      r.bottomLeft, h - r.topLeft - r.bottomLeft,
+                                      u0, v0 + (r.topLeft/h)*(v1-v0),
+                                      u0 + (r.bottomLeft/w)*(u1-u0),
+                                      v1 - (r.bottomLeft/h)*(v1-v0));
+                        }
+                    } else {
+                        if (r.bottomLeft < r.bottomRight){
+                            _img_rect(x, y + r.topLeft,
+                                      r.bottomLeft, h - r.topLeft - r.bottomLeft,
+                                      u0, v0 + (r.topLeft/h)*(v1-v0),
+                                      u0 + (r.bottomLeft/w)*(u1-u0),
+                                      v1 - (r.bottomLeft/h)*(v1-v0));
+                            _img_rect(x + r.bottomLeft, y + r.topLeft,
+                                      r.topLeft - r.bottomLeft, h - r.topLeft - r.bottomRight,
+                                      u0 + (r.bottomLeft/w)*(u1-u0),
+                                      v0 + (r.topLeft/h)*(v1-v0),
+                                      u0 + (r.topLeft/w)*(u1-u0),
+                                      v1 - (r.bottomRight/h)*(v1-v0));
+                        } else {
+                            _img_rect(x, y + r.topLeft,
+                                      r.topLeft, h - r.topLeft - r.bottomLeft,
+                                      u0, v0 + (r.topLeft/h)*(v1-v0),
+                                      u0 + (r.topLeft/w)*(u1-u0),
+                                      v1 - (r.bottomLeft/h)*(v1-v0));
+                        }
+                    }
+                
+                    // right vertical body
+                    if (r.topRight < r.bottomRight){
+                        if (r.topRight < r.topLeft){
+                            _img_rect(x + w - r.bottomRight, y + r.topLeft,
+                                      r.bottomRight - r.topRight, h - r.topLeft - r.bottomRight,
+                                      u1 - (r.bottomRight/w)*(u1-u0),
+                                      v0 + (r.topLeft/h)*(v1-v0),
+                                      u1 - (r.topRight/w)*(u1-u0),
+                                      v1 - (r.bottomRight/h)*(v1-v0));
+                            _img_rect(x + w - r.topRight, y + r.topRight,
+                                      r.topRight, h - r.topRight - r.bottomRight,
+                                      u1 - (r.topRight/w)*(u1-u0),
+                                      v0 + (r.topRight/h)*(v1-v0),
+                                      u1, v1 - (r.bottomRight/h)*(v1-v0));
+                        } else {
+                            _img_rect(x + w - r.bottomRight, y + r.topRight,
+                                      r.bottomRight, h - r.topRight - r.bottomRight,
+                                      u1 - (r.bottomRight/w)*(u1-u0),
+                                      v0 + (r.topRight/h)*(v1-v0),
+                                      u1, v1 - (r.bottomRight/h)*(v1-v0));
+                        }
+                    } else {
+                        if (r.bottomRight < r.bottomLeft){
+                            _img_rect(x + w - r.topRight, y + r.topRight,
+                                      r.topRight - r.bottomRight, h - r.topRight - r.bottomLeft,
+                                      u1 - (r.topRight/w)*(u1-u0),
+                                      v0 + (r.topRight/h)*(v1-v0),
+                                      u1 - (r.bottomRight/w)*(u1-u0),
+                                      v1 - (r.bottomLeft/h)*(v1-v0));
+                            _img_rect(x + w - r.bottomRight, y + r.topRight,
+                                      r.bottomRight, h - r.topRight - r.bottomRight,
+                                      u1 - (r.bottomRight/w)*(u1-u0),
+                                      v0 + (r.topRight/h)*(v1-v0),
+                                      u1, v1 - (r.bottomRight/h)*(v1-v0));
+                        } else {
+                            _img_rect(x + w - r.topRight, y + r.topRight,
+                                      r.topRight, h - r.topRight - r.bottomRight,
+                                      u1 - (r.topRight/w)*(u1-u0),
+                                      v0 + (r.topRight/h)*(v1-v0),
+                                      u1, v1 - (r.bottomRight/h)*(v1-v0));
+                        }
+                    }
+                
+                    // center body
+                    _img_rect(x + CLAY__MAX(r.topLeft, r.bottomLeft),
+                              y + CLAY__MAX(r.topLeft, r.topRight),
+                              w - CLAY__MAX(r.topLeft, r.bottomLeft) - CLAY__MAX(r.topRight, r.bottomRight),
+                              h - CLAY__MAX(r.topLeft, r.topRight) - CLAY__MAX(r.bottomLeft, r.bottomRight),
+                              u0 + (CLAY__MAX(r.topLeft, r.bottomLeft)/w)*(u1-u0),
+                              v0 + (CLAY__MAX(r.topLeft, r.topRight)/h)*(v1-v0),
+                              u1 - (CLAY__MAX(r.topRight, r.bottomRight)/w)*(u1-u0),
+                              v1 - (CLAY__MAX(r.bottomLeft, r.bottomRight)/h)*(v1-v0));
+                } else {
+                    // simple quad
+                    _img_rect(x, y, w, h, u0, v0, u1, v1);
+                }
+            
+                sgl_end();
+                sgl_disable_texture();
                 break;
             }
             case CLAY_RENDER_COMMAND_TYPE_BORDER: {
