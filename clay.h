@@ -1615,32 +1615,57 @@ uint32_t Clay__HashStringContentsWithConfig(Clay_String *text, Clay_TextElementC
     return hash + 1; // Reserve the hash result of zero as "null id"
 }
 
+static const uint8_t utf8d[] = {
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  9,  9,  9,  9,  9,  9,  9,  9,
+    9,  9,  9,  9,  9,  9,  9,  9,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,
+    7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,
+    7,  7,  8,  8,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+    2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  10, 3,  3,  3,
+    3,  3,  3,  3,  3,  3,  3,  3,  3,  4,  3,  3,  11, 6,  6,  6,  5,  8,  8,
+    8,  8,  8,  8,  8,  8,  8,  8,  8,  0,  12, 24, 36, 60, 96, 84, 12, 12, 12,
+    48, 72, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 0,  12, 12, 12,
+    12, 12, 0,  12, 0,  12, 12, 12, 24, 12, 12, 12, 12, 12, 24, 12, 24, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12,
+    12, 12, 24, 12, 12, 12, 12, 12, 12, 12, 12, 12, 36, 12, 36, 12, 12, 12, 36,
+    12, 12, 12, 12, 12, 36, 12, 36, 12, 12, 12, 36, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12,
+};
+
 uint32_t Clay__DecodeUTF8Codepoint(const char *str, int32_t offset, int32_t *bytesRead) {
     const unsigned char *bytes = (const unsigned char *)str + offset;
+    uint32_t state = UTF8_ACCEPT;
     uint32_t codepoint = 0;
     int32_t length = 0;
-    
-    if ((bytes[0] & 0x80) == 0) {
-        codepoint = bytes[0];
-        length = 1;
-    } else if ((bytes[0] & 0xE0) == 0xC0) {
-        codepoint = ((bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
-        length = 2;
-    } else if ((bytes[0] & 0xF0) == 0xE0) {
-        codepoint = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
-        length = 3;
-    } else if ((bytes[0] & 0xF8) == 0xF0) {
-        codepoint = ((bytes[0] & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) | 
-                    ((bytes[2] & 0x3F) << 6) | (bytes[3] & 0x3F);
-        length = 4;
-    } else {
+    for (int32_t i = 0; i < 4; i++) {
+        uint32_t byte = bytes[i];
+        uint32_t type = utf8d[byte];
+		
+        codepoint = (state != UTF8_ACCEPT) ?
+            (byte & 0x3fu) | (codepoint << 6) :
+            (0xff >> type) & (byte);
+		
+        state = utf8d[256 + state + type];
+        if (state == UTF8_ACCEPT) {
+            length = i + 1;
+            break;
+        } else if (state == UTF8_REJECT) {
+            codepoint = 0xFFFD;
+            length = 1;
+            break;
+        }
+    }
+    if (state != UTF8_ACCEPT && length == 0) {
         codepoint = 0xFFFD;
         length = 1;
     }
-    
-    if (bytesRead) {
-        *bytesRead = length;
-    }
+    if (bytesRead) *bytesRead = length;
     return codepoint;
 }
 
