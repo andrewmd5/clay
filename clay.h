@@ -1615,7 +1615,10 @@ uint32_t Clay__HashStringContentsWithConfig(Clay_String *text, Clay_TextElementC
     return hash + 1; // Reserve the hash result of zero as "null id"
 }
 
-static const uint8_t utf8d[] = {
+#define _CLAY_UTF8_ACCEPT 0
+#define _CLAY_UTF8_REJECT 12
+
+static const uint8_t _clay_utf8d[] = {
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
@@ -1640,28 +1643,28 @@ static const uint8_t utf8d[] = {
 
 uint32_t Clay__DecodeUTF8Codepoint(const char *str, int32_t offset, int32_t *bytesRead) {
     const unsigned char *bytes = (const unsigned char *)str + offset;
-    uint32_t state = UTF8_ACCEPT;
+    uint32_t state = _CLAY_UTF8_ACCEPT;
     uint32_t codepoint = 0;
     int32_t length = 0;
     for (int32_t i = 0; i < 4; i++) {
         uint32_t byte = bytes[i];
-        uint32_t type = utf8d[byte];
+        uint32_t type = _clay_utf8d[byte];
 		
-        codepoint = (state != UTF8_ACCEPT) ?
+        codepoint = (state != _CLAY_UTF8_ACCEPT) ?
             (byte & 0x3fu) | (codepoint << 6) :
             (0xff >> type) & (byte);
 		
-        state = utf8d[256 + state + type];
-        if (state == UTF8_ACCEPT) {
+        state = _clay_utf8d[256 + state + type];
+        if (state == _CLAY_UTF8_ACCEPT) {
             length = i + 1;
             break;
-        } else if (state == UTF8_REJECT) {
+        } else if (state == _CLAY_UTF8_REJECT) {
             codepoint = 0xFFFD;
             length = 1;
             break;
         }
     }
-    if (state != UTF8_ACCEPT && length == 0) {
+    if (state != _CLAY_UTF8_ACCEPT && length == 0) {
         codepoint = 0xFFFD;
         length = 1;
     }
